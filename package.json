@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "main": "index.js",
   "license": "MIT",
+  "scripts": {
+    "test": "hardhat test",
+    "compile": "hardhat compile",
+    "visualize": "npx hardhat ignition visualize",
+    "deploy:test": "yarn deploy ./ignition/modules/FactoryModule.ts --network sepolia --verify",
+    "deploy:dev": "yarn deploy ./ignition/modules/FactoryModule.ts --network localhost",
+    "start:base": "npx hardhat node --fork https://rpc.ankr.com/base/a7561d57bd20259e0f5d8ddf614a8f1b0fd281aee0212247ead4e65d8f21438c",
+    "start:sepolia": "npx hardhat node --fork https://rpc.ankr.com/eth_sepolia/a7561d57bd20259e0f5d8ddf614a8f1b0fd281aee0212247ead4e65d8f21438c"
+  },
   "devDependencies": {
     "@nomicfoundation/hardhat-chai-matchers": "^2.0.0",
     "@nomicfoundation/hardhat-ethers": "^3.0.0",
@@ -11,6 +20,7 @@
     "@nomicfoundation/hardhat-network-helpers": "^1.0.0",
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
     "@nomicfoundation/hardhat-verify": "^2.0.0",
+    "@nomiclabs/hardhat-ethers": "^2.2.3",
     "@typechain/ethers-v6": "^0.5.0",
     "@typechain/hardhat": "^9.0.0",
     "@types/chai": "^4.2.0",
@@ -27,6 +37,7 @@
   },
   "dependencies": {
     "@openzeppelin/contracts": "^5.1.0",
+    "dotenv": "^16.4.7",
     "prb-math": "^2.4.3"
   }
 }

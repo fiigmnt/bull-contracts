@@ -1,144 +1,160 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
 
-import {PRBMathUD60x18} from "prb-math/contracts/PRBMathUD60x18.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
- * DISCLAIMER:
- * This contract is a conceptual example of an ERC-20 that
- * integrates vesting + forfeiture logic *directly* into its transfer.
- * It is NOT production-ready and requires heavy testing, auditing,
- * and likely significant optimizations.
+ * @title VestingERC20Multi
+ * @notice Example contract that:
+ *   - Creates a NEW vesting schedule every time tokens are transferred (to the recipient).
+ *   - 50% is immediately vested, 50% withheld and vests over 7 days (linear).
+ *   - If sender tries to transfer more tokens than their vested amount, the difference is forfeited into a global pool.
+ *   - Fully-vested addresses earn a share of the forfeited pool via daily compounding (1%).
+ *   - FIFO approach to forfeiting withheld amounts.
+ *   - Cleans up old schedules for both parties to reduce storage usage.
  */
-
-abstract contract Context {
-    function _msgSender() internal view virtual returns (address) {
-        return msg.sender;
-    }
-}
-
-interface IERC20 {
-    event Transfer(address indexed from, address indexed to, uint256 value);
-    event Approval(
-        address indexed owner,
-        address indexed spender,
-        uint256 value
-    );
-
-    function totalSupply() external view returns (uint256);
-
-    function balanceOf(address account) external view returns (uint256);
-
-    function transfer(address to, uint256 amount) external returns (bool);
-
-    function allowance(
-        address owner,
-        address spender
-    ) external view returns (uint256);
-
-    function approve(address spender, uint256 amount) external returns (bool);
-
-    function transferFrom(
-        address from,
-        address to,
-        uint256 amount
-    ) external returns (bool);
-}
-
-contract VestingERC20 is Context, IERC20 {
-    using PRBMathUD60x18 for uint256;
-
-    // -------------------------
-    // ERC-20 Metadata
-    // -------------------------
-    string public name = "Vesting Token";
-    string public symbol = "VEST";
-    uint8 public decimals = 18;
-
-    uint256 private _totalSupply;
-    mapping(address => uint256) private _balances;
-
-    mapping(address => mapping(address => uint256)) private _allowances;
-
-    // -------------------------
-    // Vesting / Forfeiture
-    // -------------------------
-    uint256 constant VESTING_DURATION = 7 days;
-    uint256 constant SCALE = 1e18;
-    uint256 constant DAILY_INCREMENT = 1e16; // 1% of SCALE
-    
-    // In PRBMath UD60x18, "1e18" means "1.0". So 1.01 * 1e18 = 1_010000000000000000
-    uint256 public constant DAILY_RATE = 1_010000000000000000; // 1.01 * 1e18
-
-    struct VestingInfo {
-        bool exists;
-        bool fullyVested;
-        uint256 initialBalance; // total tokens that triggered vesting for this user
-        uint256 withheldAmount; // half that vests over 7 days
-        uint256 vestStart;
-        uint256 vestComplete;
-        // For 1% daily growth after vesting
-        uint256 multiple; // starts at 0, becomes SCALE (1.0) on full vest
-        uint256 lastMultipleUpdate;
-        // For claim tracking
-        uint256 claimedForfeits; // how many forfeited tokens they've already claimed
-    }
-
-    // Track vesting details per user
-    mapping(address => VestingInfo) public vestInfo;
-
-    // Forfeited pool: tokens lost by senders who transferred unvested amounts
-    uint256 public forfeitedPool;
-
-    // Weighted contributions for fully vested users:
-    // userWeightedContrib = (balanceOf(user) * user.multiple)
-    mapping(address => uint256) public userWeightedContribution;
-    uint256 public totalWeightedContributions;
+contract VestingERC20 is ERC20, Ownable, ReentrancyGuard, Pausable {
+    using Math for uint256;
 
     // -------------------------
     // Events
     // -------------------------
     event Forfeited(address indexed from, uint256 amount);
-    event VestingStarted(address indexed user, uint256 amount);
     event Claimed(address indexed user, uint256 forfeitedAmount);
+    event VestingStarted(address indexed user, uint256 amount);
+    event VestingMerged(
+        address indexed user,
+        uint256 amount,
+        uint256 scheduleIndex
+    );
+    event VestingSchedulesCleaned(
+        address indexed user,
+        uint256 schedulesRemoved
+    );
+    event ExemptionStatusUpdated(address indexed account, bool isExempt);
 
-    constructor() {
-        // Example: mint some tokens to deployer
-        _mint(_msgSender(), 1000000 * 10 ** decimals);
+    // -------------------------
+    // Custom Errors
+    // -------------------------
+    error NothingToClaim();
+    error NotAuthorized();
+    error ZeroAddress();
+    error InvalidAddress();
+    error InsufficientBalance(uint256 requested, uint256 available);
+
+    // -------------------------
+    // Constants
+    // -------------------------
+    uint256 public constant INITIAL_SUPPLY = 1_000_000_000;
+    uint256 public constant VESTING_DURATION = 7 days;
+    uint256 public constant MERGE_WINDOW = 1 days;
+    uint256 public constant MAX_SCHEDULES = 50;
+    uint256 public constant SCALE = 1e18;
+    // 1% daily growth => 1.01 * 1e18
+    uint256 public constant DAILY_RATE = 1_01e18;
+    // Precompute 1 / 7 days in 1e18 form for any linear vest calcs
+    uint256 public constant VESTING_DURATION_INV = 1e18 / VESTING_DURATION;
+
+    // -------------------------
+    // Structs & Storage
+    // -------------------------
+    struct VestingInfo {
+        // The original amount of tokens for this schedule
+        // (50% withheld, 50% immediate)
+        uint256 initialBalance;
+        // The portion that will vest linearly over 7 days
+        uint256 withheldAmount;
+        // Start & end of vest
+        uint256 vestStart;
+        uint256 vestComplete;
+        // True once time >= vestComplete
+        bool fullyVested;
+        // For daily compounding after fully vested (starts at 0, set to 1e18 upon full vest)
+        uint256 multiple;
+        // The last timestamp we applied the daily increment
+        uint256 lastMultipleUpdate;
+        // How many forfeited tokens have been claimed from this schedule
+        uint256 claimedForfeits;
+        // The last timestamp we applied the daily increment
+        uint256 lastDepositTime;
+    }
+
+    /**
+     * @dev Each user can accumulate many schedules (one per incoming transfer).
+     */
+    mapping(address => VestingInfo[]) public vestSchedules;
+
+    // Running pool of forfeited tokens
+    uint256 public forfeitedPool;
+
+    /**
+     * @dev Weighted contributions = sum of (schedule.multiple * schedule.initialBalance / 1e18)
+     *      for all *fully vested* schedules of a user. Used to pro-rate the forfeitedPool.
+     */
+    mapping(address => uint256) public userWeightedContribution;
+    uint256 public totalWeightedContributions;
+
+    // Treasury address
+    address public treasury;
+
+    /**
+     * @notice Mapping to store whitelisted addresses that are exempt from vesting (DEXs).
+     */
+    mapping(address => bool) public isExemptFromVesting;
+
+    // -------------------------
+    // Constructor
+    // -------------------------
+    constructor(
+        string memory name,
+        string memory symbol,
+        address _treasury
+    ) ERC20(name, symbol) Ownable(msg.sender) ReentrancyGuard() {
+        _mint(_treasury, INITIAL_SUPPLY * 10 ** decimals());
+        treasury = _treasury;
     }
 
     // -------------------------
-    // ERC-20 Standard Functions
+    // External (User) Functions
     // -------------------------
-    function totalSupply() public view override returns (uint256) {
-        return _totalSupply;
+    /**
+     * @notice Claim user's share of the forfeited pool across all fully-vested schedules.
+     */
+    function claim() external nonReentrant {
+        _updateAllVestingStates(msg.sender);
+
+        uint256 claimable = getClaimable(msg.sender);
+        if (claimable == 0) revert NothingToClaim();
+
+        // Reduce our internal record of forfeited pool
+        forfeitedPool -= claimable;
+
+        // Record that these forfeits are now claimed
+        _recordClaimForfeits(msg.sender, claimable);
+
+        // Transfer from the contract to the user
+        _transfer(address(treasury), msg.sender, claimable);
+
+        emit Claimed(msg.sender, claimable);
     }
 
-    function balanceOf(address account) public view override returns (uint256) {
-        return _balances[account];
-    }
-
+    // -------------------------
+    // ERC20 Overrides
+    // -------------------------
+    /**
+     * @notice On *every* transfer, the `to` address automatically gets a new vesting schedule
+     *         for the `amount` they receive.
+     *         The sender may forfeit any unvested portion if `amount` exceeds their vested balance.
+     */
     function transfer(
         address to,
         uint256 amount
-    ) public override returns (bool) {
-        _transfer(_msgSender(), to, amount);
-        return true;
-    }
-
-    function allowance(
-        address owner,
-        address spender
-    ) public view override returns (uint256) {
-        return _allowances[owner][spender];
-    }
-
-    function approve(
-        address spender,
-        uint256 amount
-    ) public override returns (bool) {
-        address owner = _msgSender();
-        _approve(owner, spender, amount);
+    ) public virtual override whenNotPaused nonReentrant returns (bool) {
+        _transferWithVesting(_msgSender(), to, amount);
         return true;
     }
 
@@ -146,264 +162,533 @@ contract VestingERC20 is Context, IERC20 {
         address from,
         address to,
         uint256 amount
-    ) public override returns (bool) {
+    ) public virtual override whenNotPaused nonReentrant returns (bool) {
         address spender = _msgSender();
         _spendAllowance(from, spender, amount);
-        _transfer(from, to, amount);
+
+        _transferWithVesting(from, to, amount);
         return true;
     }
 
     // -------------------------
-    // ERC-20 Internal Logic
+    // Owner Functions
     // -------------------------
-    function _transfer(address from, address to, uint256 amount) internal {
-        require(from != address(0), "VestingERC20: from zero address");
-        require(to != address(0), "VestingERC20: to zero address");
+    /**
+     * @notice Toggle exemption status for DEX/MM addresses
+     * @param account Address to update
+     * @param exempt True to exempt from vesting, false to remove exemption
+     */
+    function setVestingExemption(
+        address account,
+        bool exempt
+    ) external onlyOwner {
+        if (account == address(0)) revert InvalidAddress();
+        isExemptFromVesting[account] = exempt;
+        emit ExemptionStatusUpdated(account, exempt);
+    }
 
-        // Update user vesting state before any transfer logic
-        _updateVestingState(from);
-
-        // Check how many tokens are truly vested/transferable for 'from'
-        uint256 vestedBal = _getVestedBalance(from);
-        require(
-            _balances[from] >= amount,
-            "VestingERC20: transfer exceeds balance"
-        );
-
-        // If the user tries to transfer more than they have vested, the difference is unvested => Forfeit
-        uint256 unvested = 0;
-        if (amount > vestedBal) {
-            unvested = amount - vestedBal;
+    // -------------------------
+    // Public / View Functions
+    // -------------------------
+    /**
+     * @notice Returns how many forfeited tokens `user` can currently claim.
+     */
+    function getClaimable(address user) public view returns (uint256) {
+        if (totalWeightedContributions == 0) {
+            return 0;
         }
 
-        // Subtract the full amount from sender
-        _balances[from] -= amount;
+        uint256 userShare = 0;
+        VestingInfo[] memory schedules = vestSchedules[user];
+        for (uint256 i = 0; i < schedules.length; i++) {
+            VestingInfo memory info = schedules[i];
+            if (info.fullyVested) {
+                // Weighted portion
+                uint256 scheduleWeighted = (info.multiple *
+                    info.initialBalance) / SCALE;
+                uint256 scheduleShare = (scheduleWeighted * forfeitedPool) /
+                    totalWeightedContributions;
 
-        // If there is unvested portion, forfeit it
-        if (unvested > 0) {
-            forfeitedPool += unvested;
-            // Reduce withheldAmount to avoid double counting
-            VestingInfo storage info = vestInfo[from];
-            if (unvested <= info.withheldAmount) {
-                info.withheldAmount -= unvested;
-            } else {
-                info.withheldAmount = 0;
+                if (scheduleShare > info.claimedForfeits) {
+                    userShare += (scheduleShare - info.claimedForfeits);
+                }
             }
-            emit Forfeited(from, unvested);
+        }
+        return userShare;
+    }
 
-            // The receiver only gets the vested portion
+    /**
+     * @notice Returns how many tokens are currently vested across *all* schedules for `user`.
+     *         If the user doesn't have any schedules, everything is effectively vested.
+     */
+    function getVestedBalance(address user) external view returns (uint256) {
+        return _getVestedBalance(user);
+    }
+
+    /**
+     * @notice An example aggregator function that sums up the user’s total vested,
+     *         unvested, and time to next vest completion.
+     */
+    function getVestingProgress(
+        address user
+    )
+        external
+        view
+        returns (
+            uint256 totalVested,
+            uint256 totalUnvested,
+            uint256 nextVestCompletion
+        )
+    {
+        VestingInfo[] memory schedules = vestSchedules[user];
+        if (schedules.length == 0) {
+            // No schedules => all tokens are effectively vested
+            return (balanceOf(user), 0, 0);
+        }
+
+        uint256 vestedSum = 0;
+        uint256 earliestVestComplete = type(uint256).max;
+
+        for (uint256 i = 0; i < schedules.length; i++) {
+            VestingInfo memory info = schedules[i];
+            vestedSum += _computeScheduleVested(info);
+
+            if (!info.fullyVested && info.vestComplete < earliestVestComplete) {
+                earliestVestComplete = info.vestComplete;
+            }
+        }
+
+        uint256 actualBalance = balanceOf(user);
+        if (vestedSum > actualBalance) {
+            vestedSum = actualBalance;
+        }
+
+        totalVested = vestedSum;
+        totalUnvested = (actualBalance > vestedSum)
+            ? (actualBalance - vestedSum)
+            : 0;
+
+        nextVestCompletion = (earliestVestComplete == type(uint256).max)
+            ? 0
+            : (
+                block.timestamp >= earliestVestComplete
+                    ? 0
+                    : earliestVestComplete - block.timestamp
+            );
+    }
+
+    // -------------------------
+    // Internal Functions
+    // -------------------------
+
+    /**
+     * @dev Core logic for transferring with vesting:
+     *      1) Update sender & recipient vest states
+     *      2) Forfeit any unvested portion if transferring more than sender's vested
+     *      3) Perform the ERC20 transfer
+     *      4) Create a NEW vesting schedule for the recipient for the full `amount`
+     */
+    function _transferWithVesting(
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        if (to == address(0)) revert ZeroAddress();
+
+        // Case 1: Transfer between exempt addresses (DEX-to-DEX)
+        if (isExemptFromVesting[from] && isExemptFromVesting[to]) {
+            _transfer(from, to, amount);
+            return;
+        }
+
+        // Compute how many tokens the sender actually has vested
+        uint256 vestedBal = _getVestedBalance(from);
+        // Compute how many tokens are unvested
+        uint256 unvested = (amount > vestedBal) ? (amount - vestedBal) : 0;
+
+        // Case 2: Transfer TO exempt (user selling to DEX)
+        if (isExemptFromVesting[to]) {
+            _updateAllVestingStates(from);
+
+            if (unvested > 0) {
+                // Move unvested portion into the contract's balance
+                _transfer(from, address(treasury), unvested);
+                forfeitedPool += unvested;
+
+                // Remove unvested portion from user’s vesting schedules
+                _forfeitFromSchedules(from, unvested);
+                emit Forfeited(from, unvested);
+                amount = vestedBal;
+            }
+
+            _transfer(from, to, amount);
+            return;
+        }
+
+        // CASE 3: Transfer FROM an exempt address (user buying from DEX)
+        if (isExemptFromVesting[from]) {
+            _updateAllVestingStates(to);
+            _transfer(from, to, amount);
+
+            // create vesting schedule for the recipient
+            _createOrMergeVestingSchedule(to, amount);
+            return;
+        }
+
+        // CASE 4: Normal P2P transfer with vesting logic on both sides
+        _updateAllVestingStates(from);
+        _updateAllVestingStates(to);
+
+        if (unvested > 0) {
+            // Move unvested portion into the contract's balance
+            _transfer(from, address(treasury), unvested);
+            forfeitedPool += unvested;
+
+            // Remove unvested portion from user’s schedules
+            _forfeitFromSchedules(from, unvested);
+            emit Forfeited(from, unvested);
             amount = vestedBal;
         }
 
-        // Increase the balance of 'to'
-        _balances[to] += amount;
-        emit Transfer(from, to, amount);
+        // Do the actual transfer of vested amount
+        _transfer(from, to, amount);
 
-        // Optionally, you might want to start vesting for 'to' if this is a brand-new "investment."
-        // That depends on your use-case. For demonstration, we do not start new vesting automatically here.
-        // If you want each incoming transfer to vest, you'd call something like _startVesting(to, amount).
-    }
-
-    function _mint(address account, uint256 amount) internal {
-        require(account != address(0), "VestingERC20: mint to zero address");
-        _totalSupply += amount;
-        _balances[account] += amount;
-        emit Transfer(address(0), account, amount);
-    }
-
-    function _approve(address owner, address spender, uint256 amount) internal {
-        require(owner != address(0), "VestingERC20: approve from zero");
-        require(spender != address(0), "VestingERC20: approve to zero");
-        _allowances[owner][spender] = amount;
-        emit Approval(owner, spender, amount);
-    }
-
-    function _spendAllowance(
-        address owner,
-        address spender,
-        uint256 amount
-    ) internal {
-        uint256 currentAllowance = allowance(owner, spender);
-        if (currentAllowance != type(uint256).max) {
-            require(
-                currentAllowance >= amount,
-                "VestingERC20: insufficient allowance"
-            );
-            _approve(owner, spender, currentAllowance - amount);
+        // create vesting schedule for the recipient
+        if (amount > 0) {
+            _createOrMergeVestingSchedule(to, amount);
         }
     }
 
-    // -------------------------
-    // Vesting: Setup & State Updates
-    // -------------------------
     /**
-     * Example function to start vesting on an existing balance.
-     * For instance, if a user "buys in" with `amount`, half is locked.
-     * We record that in vestInfo so partial tokens are withheld for 7 days.
+     * @dev Merges a new deposit into an existing vesting schedule or creates a new one.
      */
-    function startVesting(address user, uint256 amount) external {
-        require(user != address(0), "Zero user");
-        require(balanceOf(user) >= amount, "User doesn't have enough tokens");
+    function _createOrMergeVestingSchedule(
+        address user,
+        uint256 amount
+    ) internal {
+        // First cleanup any completed schedules
+        _cleanupVestingSchedules(user);
 
-        VestingInfo storage info = vestInfo[user];
-        info.exists = true;
-        // If user invests multiple times, accumulate data:
-        info.initialBalance += amount;
-        // withheld is half of that
-        info.withheldAmount += (amount / 2);
-        info.vestStart = block.timestamp;
-        info.vestComplete = block.timestamp + VESTING_DURATION;
+        VestingInfo[] storage schedules = vestSchedules[user];
 
+        // If too many schedules, force merge with oldest non-full schedule
+        if (schedules.length >= MAX_SCHEDULES) {
+            _forceScheduleMerge(user, amount);
+            return;
+        }
+
+        // Try to find a schedule that's within our merge window
+        for (uint256 i = 0; i < schedules.length; i++) {
+            VestingInfo storage schedule = schedules[i];
+
+            // Only merge into non-fully-vested schedules within the merge window
+            if (
+                !schedule.fullyVested &&
+                block.timestamp <= schedule.lastDepositTime + MERGE_WINDOW
+            ) {
+                // Merge the amounts
+                uint256 newWithheld = amount / 2;
+                schedule.initialBalance += amount;
+                schedule.withheldAmount += newWithheld;
+                schedule.lastDepositTime = block.timestamp;
+
+                // Don't extend the vesting end time - keep original
+                emit VestingMerged(user, amount, i);
+                return;
+            }
+        }
+
+        // If no suitable schedule found, create new one
+        _createVestingSchedule(user, amount);
+    }
+
+    /**
+     * @dev Creates a new 7-day vesting schedule for `user`.
+     *      50% immediate, 50% withheld vesting linearly over 7 days.
+     */
+    function _createVestingSchedule(address user, uint256 amount) internal {
+        VestingInfo memory newSchedule;
+        newSchedule.initialBalance = amount;
+        newSchedule.withheldAmount = amount / 2;
+        newSchedule.vestStart = block.timestamp;
+        newSchedule.vestComplete = block.timestamp + VESTING_DURATION;
+        newSchedule.fullyVested = false;
+        newSchedule.multiple = 0;
+        newSchedule.lastMultipleUpdate = block.timestamp;
+        newSchedule.claimedForfeits = 0;
+        newSchedule.lastDepositTime = block.timestamp; // Added this line
+
+        vestSchedules[user].push(newSchedule);
         emit VestingStarted(user, amount);
     }
 
     /**
-     * Updates user vesting if vestComplete is reached or if we need
-     * to apply the 1% daily growth for fully vested users.
+     * @dev Iterates over all schedules, updating which ones are fully vested
+     *      and applying daily compounding if so. Then recalculates user’s
+     *      total weighted contribution.
      */
-    function _updateVestingState(address user) internal {
-        VestingInfo storage info = vestInfo[user];
-        if (!info.exists) return;
+    function _updateAllVestingStates(address user) internal {
+        VestingInfo[] storage schedules = vestSchedules[user];
+        if (schedules.length == 0) return;
 
-        // If user is now past the vesting window but wasn't flagged as fully vested yet, update them
-        if (!info.fullyVested && block.timestamp >= info.vestComplete) {
-            info.fullyVested = true;
-            info.multiple = SCALE; // start at 1.0
-            info.lastMultipleUpdate = block.timestamp;
+        // Remove old weighting from global
+        uint256 oldWeighted = userWeightedContribution[user];
+        if (oldWeighted > 0) {
+            totalWeightedContributions -= oldWeighted;
+        }
 
-            // Now that they're fully vested, we add them into the weighted contribution system
-            _updateWeightedContribution(user, true);
+        uint256 newWeightedSum = 0;
+
+        for (uint256 i = 0; i < schedules.length; i++) {
+            VestingInfo storage info = schedules[i];
+
+            // If not fully vested, check if vestComplete time has passed
+            if (!info.fullyVested && block.timestamp >= info.vestComplete) {
+                info.fullyVested = true;
+                info.multiple = SCALE; // 1.0
+                info.lastMultipleUpdate = block.timestamp;
+            }
+
+            // If fully vested, apply daily increments
+            if (info.fullyVested) {
+                _applyDailyIncrement(info);
+                // Weighted = (multiple * initialBalance) / 1e18
+                uint256 scheduleWeighted = (info.multiple *
+                    info.initialBalance) / SCALE;
+                newWeightedSum += scheduleWeighted;
+            }
         }
-        // If they’re already fully vested, apply the daily multiplier updates
-        else if (info.fullyVested) {
-            _applyDailyIncrement(user);
-        }
+
+        // Update user weighting
+        userWeightedContribution[user] = newWeightedSum;
+        // Update global weighting
+        totalWeightedContributions += newWeightedSum;
     }
 
-    // Linear vesting: immediate half, plus withheld vesting linearly
-    function _getVestedBalance(address user) public view returns (uint256) {
-        VestingInfo memory info = vestInfo[user];
-        uint256 actualBalance = _balances[user];
-        if (!info.exists) {
-            return actualBalance;
-        }
+    /**
+     * @dev Deduct `toForfeit` from the user's withheld tokens in FIFO order
+     *      until we've accounted for all unvested tokens that need forfeiting.
+     */
+    function _forfeitFromSchedules(address from, uint256 toForfeit) internal {
+        VestingInfo[] storage schedules = vestSchedules[from];
 
-        // If fully vested, user can move everything in their balance
-        if (info.fullyVested) {
-            return actualBalance;
-        }
+        for (uint256 i = 0; i < schedules.length; i++) {
+            if (toForfeit == 0) break;
+            VestingInfo storage info = schedules[i];
 
-        // Otherwise, partially vested:
-        uint256 immediate = info.initialBalance / 2;
-        // how much withheld is vested now?
-        uint256 timePassed = block.timestamp > info.vestComplete
-            ? VESTING_DURATION
-            : (block.timestamp - info.vestStart);
-        uint256 vestedWithheld = (info.withheldAmount * timePassed) /
-            VESTING_DURATION;
+            if (info.withheldAmount > 0) {
+                uint256 amountHere = info.withheldAmount;
+                uint256 forfeitAmount = (amountHere >= toForfeit)
+                    ? toForfeit
+                    : amountHere;
 
-        uint256 totalVested = immediate + vestedWithheld;
-        // user can't vest more than they actually have
-        if (totalVested > actualBalance) {
-            return actualBalance;
-        } else {
-            return totalVested;
+                info.withheldAmount -= forfeitAmount;
+                toForfeit -= forfeitAmount;
+            }
         }
+        // TODO: come back to this
+        // If `toForfeit` remains > 0 after the loop, it means
+        // user is forfeiting more than all withheld amounts combined.
+        // That generally shouldn't happen if logic is correct.
     }
 
-    // -------------------------
-    // Daily 1% Growth
-    // -------------------------
-    function _applyDailyIncrement(address user) internal {
-        VestingInfo storage info = vestInfo[user];
+    /**
+     * @dev Apply daily increment using simplified interest calculation
+     *      and OpenZeppelin's Math for safe operations
+     */
+    function _applyDailyIncrement(VestingInfo storage info) internal {
         uint256 daysPassed = (block.timestamp - info.lastMultipleUpdate) /
             1 days;
         if (daysPassed == 0) return;
 
-        // Remove old contribution from total
-        uint256 oldWeighted = userWeightedContribution[user];
-        totalWeightedContributions -= oldWeighted;
+        if (daysPassed > 365) daysPassed = 365;
 
-        // newMultiple = oldMultiplier * (1.01^daysPassed)
-        // oldMultiplier and dailyRate are in 60.18
-        uint256 exponent = daysPassed * SCALE;
-        uint256 growthFactor = DAILY_RATE.pow(exponent);
-        info.multiple = info.multiple.mul(growthFactor);
+        // Calculate total interest (days * 0.01)
+        uint256 totalInterest = daysPassed * (DAILY_RATE - SCALE);
 
-        // Recalculate user weighted
+        // Growth factor is 1.0 + total interest
+        uint256 growthFactor = SCALE + totalInterest;
+
+        // Apply growth to current multiple using OpenZeppelin's Math
+        info.multiple = Math.mulDiv(info.multiple, growthFactor, SCALE);
         info.lastMultipleUpdate += daysPassed * 1 days;
-        uint256 newWeighted = (balanceOf(user) * info.multiple) / SCALE;
-        userWeightedContribution[user] = newWeighted;
-        totalWeightedContributions += newWeighted;
     }
 
     /**
-     * Called when a user first becomes fully vested (or if their balance changes drastically).
-     * The `addOrRemove` parameter indicates if we’re adding them to the system or removing them
-     * if their balance goes to zero. In this simple version, we only add once they vest.
+     * @dev Sums how many tokens are vested right now across all of user's schedules.
+     *      Compares that with user's actual on-chain balance, returning the min.
      */
-    function _updateWeightedContribution(
-        address user,
-        bool addOrRemove
-    ) internal {
-        uint256 oldWeighted = userWeightedContribution[user];
-        if (oldWeighted > 0) {
-            totalWeightedContributions -= oldWeighted;
-            userWeightedContribution[user] = 0;
+    function _getVestedBalance(address user) internal view returns (uint256) {
+        VestingInfo[] memory schedules = vestSchedules[user];
+        if (schedules.length == 0) {
+            // No schedules => all tokens are effectively vested
+            return balanceOf(user);
         }
 
-        if (addOrRemove) {
-            // fresh calculation
-            // Their multiple is at least 1.0
-            uint256 newWeighted = (balanceOf(user) * vestInfo[user].multiple) /
-                SCALE;
-            userWeightedContribution[user] = newWeighted;
-            totalWeightedContributions += newWeighted;
+        uint256 vestedSum = 0;
+        for (uint256 i = 0; i < schedules.length; i++) {
+            vestedSum += _computeScheduleVested(schedules[i]);
         }
-    }
 
-    // -------------------------
-    // Claiming Forfeited Pool
-    // -------------------------
-    /**
-     * getClaimable() – a view function so your front-end can display how many tokens
-     * from the forfeited pool a user can claim right now.
-     */
-    function getClaimable(address user) public view returns (uint256) {
-        VestingInfo memory info = vestInfo[user];
-        if (!info.fullyVested || totalWeightedContributions == 0) {
-            return 0;
-        }
-        // Weighted share
-        uint256 userWeighted = (balanceOf(user) * info.multiple) / SCALE;
-        uint256 userShare = (userWeighted * forfeitedPool) /
-            totalWeightedContributions;
-        // user can only claim what's above what they've claimed before
-        if (userShare <= info.claimedForfeits) {
-            return 0;
-        }
-        return (userShare - info.claimedForfeits);
+        uint256 actualBalance = balanceOf(user);
+        return (vestedSum > actualBalance) ? actualBalance : vestedSum;
     }
 
     /**
-     * claim() – user calls this to claim their share of the forfeitedPool.
-     * We recalculate how much they can claim, transfer it out, and mark them as claimed.
+     * @dev Computes how many tokens are vested in a single schedule at this moment.
+     *      50% immediate, plus linear vesting of the withheld half over 7 days.
      */
-    function claim() external {
-        _updateVestingState(_msgSender()); // update multiple, etc.
+    function _computeScheduleVested(
+        VestingInfo memory info
+    ) internal view returns (uint256) {
+        if (info.fullyVested) {
+            return info.initialBalance;
+        }
 
-        uint256 claimable = getClaimable(_msgSender());
-        require(claimable > 0, "Nothing to claim");
+        uint256 immediate = info.initialBalance / 2;
+        uint256 timePassed = (block.timestamp > info.vestComplete)
+            ? VESTING_DURATION
+            : (block.timestamp - info.vestStart);
 
-        // update user’s claimedForfeits
-        vestInfo[_msgSender()].claimedForfeits += claimable;
-        // remove from global forfeitedPool
-        forfeitedPool -= claimable;
-        // send tokens
-        _balances[address(this)] += 0; // no-op, just for demonstration if we minted from contract
-        _balances[_msgSender()] += claimable;
-        emit Transfer(address(0), _msgSender(), claimable); // or "from the contract" if you minted to the contract
+        // linear fraction of withheld
+        uint256 vestedWithheld = (info.withheldAmount * timePassed) /
+            VESTING_DURATION;
+        return immediate + vestedWithheld;
+    }
 
-        emit Claimed(_msgSender(), claimable);
+    /**
+     * @dev After we compute how much a user can claim, we distribute that claim
+     *      across the user's fully-vested schedules, proportionally to their weighted share.
+     *      Then cleanup any schedules that have claimed all their forfeits.
+     */
+    function _recordClaimForfeits(address user, uint256 totalToClaim) internal {
+        VestingInfo[] storage schedules = vestSchedules[user];
+
+        // 1) sum up total weighting across fully vested schedules
+        uint256 totalUserWeighted = 0;
+        for (uint256 i = 0; i < schedules.length; i++) {
+            VestingInfo storage info = schedules[i];
+            if (info.fullyVested) {
+                uint256 scheduleWeighted = (info.multiple *
+                    info.initialBalance) / SCALE;
+                totalUserWeighted += scheduleWeighted;
+            }
+        }
+
+        if (totalUserWeighted == 0) {
+            // should not happen if claimable > 0, but just in case
+            return;
+        }
+
+        // 2) distribute totalToClaim proportionally
+        uint256 remaining = totalToClaim;
+        for (uint256 i = 0; i < schedules.length; i++) {
+            if (remaining == 0) break;
+            VestingInfo storage info = schedules[i];
+
+            if (info.fullyVested) {
+                uint256 scheduleWeighted = (info.multiple *
+                    info.initialBalance) / SCALE;
+                uint256 claimShare = (scheduleWeighted * totalToClaim) /
+                    totalUserWeighted;
+                if (claimShare > remaining) {
+                    claimShare = remaining;
+                }
+
+                info.claimedForfeits += claimShare;
+                remaining -= claimShare;
+            }
+        }
+
+        // 3) Cleanup any schedules that have claimed all their forfeits
+        _cleanupVestingSchedules(user);
+    }
+
+    /**
+     * @dev Forces merging of new amount into an existing schedule when user has too many schedules.
+     * Priority for merging:
+     * 1. First non-fully vested schedule
+     * 2. If all are vested, merge with newest schedule
+     * @param user Address of the user receiving tokens
+     * @param amount Amount of tokens to add to a schedule
+     */
+    function _forceScheduleMerge(address user, uint256 amount) internal {
+        // First try to clean up any old schedules
+        _cleanupVestingSchedules(user);
+
+        VestingInfo[] storage schedules = vestSchedules[user];
+        require(schedules.length > 0, "No schedules to merge with");
+
+        // Try to find first non-fully vested schedule
+        for (uint256 i = 0; i < schedules.length; i++) {
+            VestingInfo storage schedule = schedules[i];
+
+            if (!schedule.fullyVested) {
+                // Calculate remaining vesting duration
+                uint256 remainingTime = 0;
+                if (block.timestamp < schedule.vestComplete) {
+                    remainingTime = schedule.vestComplete - block.timestamp;
+                }
+
+                // Add new amounts
+                uint256 newWithheld = amount / 2;
+                schedule.initialBalance += amount;
+                schedule.withheldAmount += newWithheld;
+                schedule.lastDepositTime = block.timestamp;
+
+                // Extend vesting end time proportionally based on new amount
+                if (remainingTime > 0) {
+                    uint256 originalAmount = schedule.initialBalance - amount;
+                    uint256 weightedDuration = (remainingTime *
+                        amount +
+                        VESTING_DURATION *
+                        originalAmount) / (amount + originalAmount);
+                    schedule.vestComplete = block.timestamp + weightedDuration;
+                }
+
+                emit VestingMerged(user, amount, i);
+                return;
+            }
+        }
+
+        // If all schedules are fully vested, merge with the newest one (last in array)
+        VestingInfo storage newestSchedule = schedules[schedules.length - 1];
+
+        // Since it's fully vested, we just need to add the amounts
+        newestSchedule.initialBalance += amount;
+        // The multiple stays the same since it's based on time vested
+        // The lastMultipleUpdate stays the same to maintain compound interest schedule
+
+        emit VestingMerged(user, amount, schedules.length - 1);
+    }
+
+    /**
+     * @dev Cleans up vesting schedules for a user, removing fully vested schedules with no pending claims.
+     */
+    function _cleanupVestingSchedules(address user) internal {
+        VestingInfo[] storage schedules = vestSchedules[user];
+        uint256 initialLength = schedules.length;
+        uint256 i = 0;
+        while (i < schedules.length) {
+            VestingInfo storage schedule = schedules[i];
+            // Check if schedule is fully vested and has no pending claims
+            if (
+                schedule.fullyVested &&
+                schedule.claimedForfeits >=
+                (schedule.multiple * schedule.initialBalance * forfeitedPool) /
+                    (totalWeightedContributions * SCALE)
+            ) {
+                // Remove by swapping with last element and popping
+                schedules[i] = schedules[schedules.length - 1];
+                schedules.pop();
+            } else {
+                i++;
+            }
+        }
+
+        uint256 removed = initialLength - schedules.length;
+        if (removed > 0) {
+            emit VestingSchedulesCleaned(user, removed);
+        }
     }
 }
